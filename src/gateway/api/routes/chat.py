@@ -24,9 +24,18 @@ from gateway.core.config import GatewayConfig
 from gateway.log_config import logger
 from gateway.metrics import record_cost, record_tokens
 from gateway.models.entities import APIKey, UsageLog
+from gateway.models.mcp import McpServerConfig
 from gateway.rate_limit import RateLimitInfo, check_rate_limit
 from gateway.services.budget_service import validate_user_budget
 from gateway.services.log_writer import LogWriter
+from gateway.services.mcp_client import MCPClientPool
+from gateway.services.mcp_loop import (
+    DEFAULT_MAX_TOOL_ITERATIONS,
+    MAX_TOOL_ITERATIONS_CAP,
+    inject_purpose_hints,
+    mcp_tool_loop,
+    mcp_tool_loop_stream,
+)
 from gateway.services.pricing_service import find_model_pricing
 from gateway.streaming import (
     OPENAI_STREAM_FORMAT,
@@ -73,6 +82,8 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
+    mcp_servers: list[McpServerConfig] | None = None
+    max_tool_iterations: int | None = Field(default=None, ge=1, le=MAX_TOOL_ITERATIONS_CAP)
 
 
 def get_provider_kwargs(
@@ -596,13 +607,45 @@ async def chat_completions(
         provider, model = AnyLLM.split_model_provider(request.model)
         provider_kwargs = get_provider_kwargs(config, provider)
 
+        # Standalone streaming path: single attempt, optionally wrapped in
+        # the MCP tool-use loop. When `mcp_servers` is set the tool loop owns
+        # the stream and re-emits chunks; the multi-attempt fallback
+        # (`_run_streaming_with_fallback`) is intentionally not used because
+        # an MCP-driven request shouldn't silently swap providers mid-loop.
+        mcp_server_configs = request.mcp_servers
+        max_tool_iterations = min(
+            request.max_tool_iterations or DEFAULT_MAX_TOOL_ITERATIONS,
+            MAX_TOOL_ITERATIONS_CAP,
+        )
+
         request_fields = request.model_dump(exclude_unset=True)
+        request_fields.pop("mcp_servers", None)
+        request_fields.pop("max_tool_iterations", None)
         completion_kwargs = {**provider_kwargs, **request_fields}
         if completion_kwargs.get("stream_options") is None:
             completion_kwargs["stream_options"] = {"include_usage": True}
 
         try:
-            stream: AsyncIterator[ChatCompletionChunk] = await acompletion(**completion_kwargs)  # type: ignore[assignment]
+            if mcp_server_configs:
+
+                async def _mcp_stream() -> AsyncIterator[ChatCompletionChunk]:
+                    async with MCPClientPool(mcp_server_configs) as pool:
+                        kwargs = {
+                            **completion_kwargs,
+                            "messages": inject_purpose_hints(
+                                completion_kwargs["messages"], pool.purpose_hints()
+                            ),
+                        }
+                        async for chunk in mcp_tool_loop_stream(
+                            completion_kwargs=kwargs,
+                            pool=pool,
+                            max_iterations=max_tool_iterations,
+                        ):
+                            yield chunk
+
+                stream: AsyncIterator[ChatCompletionChunk] = _mcp_stream()
+            else:
+                stream = await acompletion(**completion_kwargs)  # type: ignore[assignment]
         except HTTPException:
             raise
         except Exception as exc:
@@ -644,12 +687,19 @@ async def chat_completions(
         )
 
     # ------------------------------------------------------------------
-    # Non-streaming path: iterate attempts on retryable failures.
+    # Non-streaming path. Routing-policy fallback (`route.attempts`) and MCP
+    # tool-use loops are mutually exclusive: when `mcp_servers` is set we run
+    # a single MCP loop against the primary attempt's credentials and skip
+    # the per-attempt retry walk (see PR design note — an MCP-driven request
+    # shouldn't silently swap providers between tool-use rounds).
     # ------------------------------------------------------------------
+    mcp_server_configs = request.mcp_servers
+    max_tool_iterations = min(
+        request.max_tool_iterations or DEFAULT_MAX_TOOL_ITERATIONS,
+        MAX_TOOL_ITERATIONS_CAP,
+    )
+
     if platform_mode:
-        # Bind to a non-Optional local so mypy can narrow inside the retry loop
-        # below — assert-based narrowing doesn't survive across function calls
-        # in some mypy configurations.
         if route is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -658,9 +708,6 @@ async def chat_completions(
         platform_route = route
         attempts_to_try = platform_route.attempts
         if not attempts_to_try:
-            # A spec-compliant platform always returns at least one attempt;
-            # treating an empty list as a server bug is more useful than letting
-            # the loop fall through silently with no `last_exc`.
             logger.error(
                 "Platform returned empty attempts list request_id=%s",
                 platform_route.request_id,
@@ -669,6 +716,9 @@ async def chat_completions(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Authorization service returned no resolvable provider",
             )
+        # MCP mode: collapse to the primary attempt, no per-attempt fallback.
+        if mcp_server_configs:
+            attempts_to_try = attempts_to_try[:1]
     else:
         provider, model = AnyLLM.split_model_provider(request.model)
         provider_kwargs = get_provider_kwargs(config, provider)
@@ -684,9 +734,9 @@ async def chat_completions(
     last_exc: BaseException | None = None
 
     if platform_mode:
-        # Snapshot the client's request body once; only `model` and provider creds
-        # change per attempt.
         base_request_fields = request.model_dump(exclude_unset=True)
+        base_request_fields.pop("mcp_servers", None)
+        base_request_fields.pop("max_tool_iterations", None)
         for attempt in attempts_to_try:
             attempt_provider = LLMProvider(attempt.provider)
             attempt_model = attempt.model
@@ -701,7 +751,21 @@ async def chat_completions(
             }
 
             try:
-                completion: ChatCompletion = await acompletion(**completion_kwargs)  # type: ignore[assignment]
+                if mcp_server_configs:
+                    async with MCPClientPool(mcp_server_configs) as pool:
+                        mcp_kwargs = {
+                            **completion_kwargs,
+                            "messages": inject_purpose_hints(
+                                completion_kwargs["messages"], pool.purpose_hints()
+                            ),
+                        }
+                        completion: ChatCompletion = await mcp_tool_loop(
+                            completion_kwargs=mcp_kwargs,
+                            pool=pool,
+                            max_iterations=max_tool_iterations,
+                        )
+                else:
+                    completion = await acompletion(**completion_kwargs)  # type: ignore[assignment]
             except HTTPException:
                 raise
             except BaseException as exc:
@@ -770,12 +834,30 @@ async def chat_completions(
             detail=detail,
         ) from last_exc
 
-    # Standalone path (no platform / no fallback).
+    # Standalone path (no platform / no fallback). Same MCP semantics as
+    # platform mode above: if `mcp_servers` is set, the request goes through
+    # the tool-use loop instead of a single ``acompletion`` call.
     request_fields = request.model_dump(exclude_unset=True)
+    request_fields.pop("mcp_servers", None)
+    request_fields.pop("max_tool_iterations", None)
     completion_kwargs = {**provider_kwargs, **request_fields}
 
     try:
-        completion = await acompletion(**completion_kwargs)  # type: ignore[assignment]
+        if mcp_server_configs:
+            async with MCPClientPool(mcp_server_configs) as pool:
+                mcp_kwargs = {
+                    **completion_kwargs,
+                    "messages": inject_purpose_hints(
+                        completion_kwargs["messages"], pool.purpose_hints()
+                    ),
+                }
+                completion = await mcp_tool_loop(
+                    completion_kwargs=mcp_kwargs,
+                    pool=pool,
+                    max_iterations=max_tool_iterations,
+                )
+        else:
+            completion = await acompletion(**completion_kwargs)  # type: ignore[assignment]
         if db is not None:
             await log_usage(
                 db=db,
