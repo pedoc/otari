@@ -135,7 +135,9 @@ Content-Type: application/json
     "completion_tokens": 7,
     "total_tokens": 20
   },
-  "error_class": "http_401"            // present on error only; see below
+  "error_class": "http_401"            // optional on error; omitted when the
+                                       // gateway can't classify the failure
+                                       // (e.g. mid-stream errors). See below.
 }
 ```
 
@@ -151,6 +153,11 @@ resolve response). The platform is responsible for correlating them.
 | `conn_err` | `httpx.NetworkError` |
 | `http_<code>` | Provider returned an HTTP status code (e.g. `http_429`, `http_401`) |
 | `unknown` | Any other exception class |
+
+The field is **omitted entirely** when the gateway can't classify the failure
+back to an exception — this happens with mid-stream errors surfaced via the
+SSE channel, where only an error string is available. Treat a missing
+`error_class` as "uncategorised error" when aggregating.
 
 ### Retry semantics
 

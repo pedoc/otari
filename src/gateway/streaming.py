@@ -128,19 +128,22 @@ async def iterate_streaming_attempts(
     For each attempt:
 
     1. ``build_stream(attempt)`` is awaited — typically wraps ``acompletion``.
-       If it raises, classify the error: retryable errors call
-       ``on_attempt_failed`` and continue; non-retryable errors propagate.
+       If it raises, the error is classified, ``on_attempt_failed`` is called
+       so the caller can record per-attempt failure metadata (regardless of
+       whether the error is retryable), then retryable errors continue to the
+       next attempt and non-retryable errors propagate.
     2. The first chunk is awaited with a ``first_chunk_timeout_seconds`` cap.
        If the timeout fires or the upstream raises before yielding, the same
-       classification logic applies and we move on.
+       classification + ``on_attempt_failed`` logic applies.
     3. Once a first chunk is in hand, we commit — the function returns and
        the caller flushes the response. Errors after this point reach the
        client; they cannot be hidden without buffering the entire stream.
 
     This is the streaming-mode analogue of the non-streaming retry loop in
-    ``chat.py``. The contract is identical: skip-and-continue on retryable
-    failures, raise on the first non-retryable failure, raise the last
-    exception if every attempt is exhausted.
+    ``chat.py``. The contract is identical: ``on_attempt_failed`` records every
+    failed attempt, retryable failures skip-and-continue, non-retryable
+    failures propagate immediately, and the last exception is raised if every
+    attempt is exhausted with retryable failures.
 
     Latency contract: zero added latency in the success case — we hold the
     first chunk only long enough to call this function's caller. In the

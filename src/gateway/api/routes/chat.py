@@ -533,12 +533,14 @@ async def chat_completions(
             await db.rollback()
 
     # ------------------------------------------------------------------
-    # Streaming path: take the first attempt only — no fallback.
+    # Streaming path: iterate `route.attempts` before any bytes are flushed,
+    # then commit to the first attempt that yields a chunk. Implemented in
+    # `_run_streaming_with_fallback` via `iterate_streaming_attempts`.
     #
-    # Mid-stream failover would require either silently buffering the prefix
-    # (which delays the first byte) or a client-aware "restart" event (which
-    # breaks OpenAI-SDK compatibility). Both are out of scope for this version.
-    # If the only attempt fails, the error propagates to the client as today.
+    # Mid-stream failover (after first chunk) is out of scope: recovering
+    # would require either silently buffering the prefix (delays first byte)
+    # or a client-aware "restart" event (breaks OpenAI-SDK compatibility).
+    # Errors after first chunk propagate to the client.
     # ------------------------------------------------------------------
     if request.stream:
         if platform_mode:
